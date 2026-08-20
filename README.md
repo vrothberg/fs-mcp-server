@@ -6,63 +6,76 @@ An MCP server for filesystem operations that AI coding agents should not need to
 
 Coding agents like Claude Code, Cursor, and OpenCode use Bash tool calls for basic filesystem operations: `ls`, `find`, `stat`, `test -f`. Each call spawns a shell process, produces human-formatted text output, and the model has to parse that text to extract the 2-3 fields it actually needs.
 
-This server replaces those Bash calls with structured MCP tools that return JSON. The savings vary by operation:
+This server replaces those Bash calls with MCP tools that return compact plain text instead of verbose shell output.
 
-| Operation | Avg Bash output | Avg MCP output | Savings |
-|---|---|---|---|
-| `ls -la` (detailed listing) | 520 chars | 322 chars | 38% |
-| `find` (recursive search) | 1,186 chars | 545 chars | 54% |
-| existence check (`test -f`, `ls 2>/dev/null`) | 341 chars | 22 chars | 94% |
-| `stat` / `wc -l` | 289 chars | 120 chars | 58% |
+### Where tokens go to waste
 
-Data from 74 Claude Code sessions, 183 filesystem Bash calls. Overall savings: 42% fewer output chars. Simple `ls` (names only) is at parity: the MCP server returns plain text, not JSON, so there is no overhead.
+Three layers of waste stack up in the typical agent-to-filesystem path:
+
+1. **Model drift.** Claude and Sonnet models default to `ls -la` out of habit, fetching permissions, owner, group, and timestamps when they just need file names. Analysis of 251 `ls -la` calls across real sessions shows that most of them only needed names. The tool description is the lever: it shapes what the model asks for.
+
+2. **JSON overhead.** MCP's default wire format repeats key names (`"name":`, `"type":`, `"size":`) on every entry. For a 12-entry directory that is ~200 chars of repeated keys carrying zero information. Plain text with positional fields eliminates that entirely. The LLM does not need JSON to understand `go.mod file 484`.
+
+3. **All-or-nothing APIs.** Most MCP tools offer one fixed response shape. A `ps -o` style `fields` parameter lets the caller request exactly the columns it needs, so a simple listing costs ~100 chars and a full audit costs ~650, instead of always paying ~960 for `ls -la` or ~1,300 for per-file JSON.
+
+The compound effect is real: if an agent runs 50 directory listings in a session, the difference between `ls -la` and names-only is ~43,000 chars of wasted context. That is tokens the model has to read, attend to, and pay for, all carrying no useful signal.
+
+### Savings by operation
+
+| Fields requested | MCP output | vs `ls -la` (~960 chars) |
+|---|---|---|
+| `name` only (default) | ~100 chars | **90% savings** |
+| `name, size` | ~135 chars | **86% savings** |
+| `name, type` | ~150 chars | **84% savings** |
+| `name, type, size` | ~195 chars | **80% savings** |
+| `name, type, size, perm` | ~325 chars | **66% savings** |
+| `name, type, size, perm, modified` | ~650 chars | **32% savings** |
+
+Other tools:
+
+| Operation | Bash equivalent | Savings |
+|---|---|---|
+| `find_files` | `find -name` | 57% |
+| `file_exists` | `test -f`, `ls 2>/dev/null` | 42-82% |
+| `file_info` | `stat` + `wc -l` | 59% |
 
 ## Tools
 
 | Tool | Replaces | What it returns |
 |---|---|---|
-| `list_directory` | `ls`, `ls -la` | `{entries: [{name, type, size}]}` |
+| `list_directory` | `ls`, `ls -la` | One name per line; use `fields` (like `ps -o`) to add columns: type, size, perm, modified, lines |
 | `find_files` | `find` | `{matches: ["relative/path", ...]}` |
 | `file_info` | `stat`, `wc -l`, `file` | `{name, type, size, permissions, modified, lines}` |
 | `file_exists` | `test -f`, `ls 2>/dev/null` | `{exists: bool, type: "file"\|"dir"\|"symlink"}` |
 
-## Install
+## Install and configure
+
+Install:
 
 ```
 go install github.com/vrothberg/fs-mcp-server@latest
 ```
 
-Or build from source:
+Add the MCP server to Claude Code:
 
 ```
-git clone https://github.com/vrothberg/fs-mcp-server
-cd fs-mcp-server
-go build -o fs-mcp-server .
+claude mcp add fs-mcp-server -- go run github.com/vrothberg/fs-mcp-server@latest
 ```
 
-## Configure for Claude Code
+Or, if you prefer pointing at the installed binary:
 
-Add to `~/.claude/settings.json`:
+```
+claude mcp add fs-mcp-server -- $(go env GOPATH)/bin/fs-mcp-server
+```
+
+For Cursor or other MCP clients, add to your MCP configuration:
 
 ```json
 {
   "mcpServers": {
     "fs": {
-      "command": "/path/to/fs-mcp-server"
-    }
-  }
-}
-```
-
-## Configure for Cursor / other MCP clients
-
-Add to your MCP configuration:
-
-```json
-{
-  "mcpServers": {
-    "fs": {
-      "command": "/path/to/fs-mcp-server",
+      "command": "go",
+      "args": ["run", "github.com/vrothberg/fs-mcp-server@latest"],
       "transport": "stdio"
     }
   }

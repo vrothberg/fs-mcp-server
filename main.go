@@ -22,18 +22,8 @@ const version = "0.1.0"
 // validates incoming requests against that schema before calling the handler.
 
 type ListDirectoryInput struct {
-	Path   string `json:"path" jsonschema:"absolute path to list"`
-	Detail bool   `json:"detail,omitempty" jsonschema:"include type and size for each entry (default: names only)"`
-}
-
-type DirEntry struct {
-	Name string `json:"name"`
-	Type string `json:"type,omitempty"`
-	Size *int64 `json:"size,omitempty"`
-}
-
-type ListDirectoryOutput struct {
-	Entries []DirEntry `json:"entries"`
+	Path   string   `json:"path" jsonschema:"absolute path to list"`
+	Fields []string `json:"fields,omitempty" jsonschema:"columns to include per entry, like ps -o. Available: name (always included), type, size, perm, modified, lines. Example: [\"name\",\"size\",\"perm\"]. Default: name only."`
 }
 
 type FindFilesInput struct {
@@ -77,43 +67,75 @@ type FileExistsOutput struct {
 //   - (result, _, nil): raw CallToolResult is sent as-is (used for plain text).
 //   - (_, _, err):      SDK returns an error to the caller.
 
-// handleListDirectory returns directory contents in one of two modes:
-//   - detail=false (default): plain text, one name per line. Identical output
-//     to `ls`, so there is zero token overhead vs Bash. This avoids the trap
-//     of wrapping simple names in JSON and making things worse.
-//   - detail=true: structured JSON with name, type, and size per entry.
-//     Smaller than `ls -la` because it drops owner, group, date formatting,
-//     and alignment padding.
-func handleListDirectory(_ context.Context, _ *mcp.CallToolRequest, in ListDirectoryInput) (*mcp.CallToolResult, ListDirectoryOutput, error) {
+// handleListDirectory returns directory contents as compact plain text.
+// Fields control which columns appear per line (like ps -o). With no fields
+// or just "name", output is one name per line. Additional fields are appended
+// space-separated: e.g. fields=["name","size","perm"] -> "go.mod 484 -rw-r--r--".
+func handleListDirectory(_ context.Context, _ *mcp.CallToolRequest, in ListDirectoryInput) (*mcp.CallToolResult, any, error) {
 	entries, err := os.ReadDir(in.Path)
 	if err != nil {
-		return nil, ListDirectoryOutput{}, fmt.Errorf("reading directory: %w", err)
+		return nil, nil, fmt.Errorf("reading directory: %w", err)
 	}
 
-	if !in.Detail {
-		var b strings.Builder
-		for _, e := range entries {
-			b.WriteString(e.Name())
-			b.WriteByte('\n')
-		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: b.String()}},
-		}, ListDirectoryOutput{}, nil
+	wantFields := make(map[string]bool)
+	for _, f := range in.Fields {
+		wantFields[f] = true
 	}
+	needsInfo := wantFields["type"] || wantFields["size"] || wantFields["perm"] || wantFields["modified"] || wantFields["lines"]
 
-	out := ListDirectoryOutput{Entries: make([]DirEntry, 0, len(entries))}
+	var b strings.Builder
 	for _, e := range entries {
-		entry := DirEntry{
-			Name: e.Name(),
-			Type: entryType(e.Type()),
+		var info os.FileInfo
+		if needsInfo {
+			info, _ = e.Info()
 		}
-		if info, err := e.Info(); err == nil && !e.IsDir() {
-			size := info.Size()
-			entry.Size = &size
+
+		parts := []string{e.Name()}
+
+		for _, f := range in.Fields {
+			switch f {
+			case "name":
+				continue
+			case "type":
+				parts = append(parts, entryType(e.Type()))
+			case "size":
+				if info != nil && !e.IsDir() {
+					parts = append(parts, fmt.Sprintf("%d", info.Size()))
+				} else {
+					parts = append(parts, "-")
+				}
+			case "perm":
+				if info != nil {
+					parts = append(parts, info.Mode().Perm().String())
+				} else {
+					parts = append(parts, "-")
+				}
+			case "modified":
+				if info != nil {
+					parts = append(parts, info.ModTime().Format(time.RFC3339))
+				} else {
+					parts = append(parts, "-")
+				}
+			case "lines":
+				path := filepath.Join(in.Path, e.Name())
+				if info != nil && info.Mode().IsRegular() {
+					if n, err := countLines(path); err == nil {
+						parts = append(parts, fmt.Sprintf("%d", n))
+					} else {
+						parts = append(parts, "-")
+					}
+				} else {
+					parts = append(parts, "-")
+				}
+			}
 		}
-		out.Entries = append(out.Entries, entry)
+
+		b.WriteString(strings.Join(parts, " "))
+		b.WriteByte('\n')
 	}
-	return nil, out, nil
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: b.String()}},
+	}, nil, nil
 }
 
 // handleFindFiles walks a directory tree and returns relative paths. The main
@@ -274,7 +296,7 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_directory",
-		Description: "List the contents of a directory. Returns structured entries with name, type (file/dir/symlink), and size. More token-efficient than `ls` because output is structured JSON with no formatting noise.",
+		Description: "List the contents of a directory. By default returns one name per line. Use the fields parameter (like ps -o) to add only the columns you need: type, size, perm, modified, lines. Example: fields=[\"name\",\"size\"] returns \"go.mod 484\" per line. Only request fields you will actually use.",
 		InputSchema: mustSchema[ListDirectoryInput](),
 	}, handleListDirectory)
 

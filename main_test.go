@@ -192,18 +192,27 @@ func TestListDirectory_NamesMatch(t *testing.T) {
 func TestListDirectory_DetailIncludesType(t *testing.T) {
 	root := setupFixtureTree(t)
 
-	_, out, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{Path: root, Detail: true})
+	result, _, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{Path: root, Fields: []string{"name", "type"}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if result == nil || len(result.Content) == 0 {
+		t.Fatal("no result returned")
+	}
 
-	if len(out.Entries) == 0 {
-		t.Fatal("no entries returned")
+	text := result.Content[0].(*mcp.TextContent).Text
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	if len(lines) == 0 {
+		t.Fatal("no lines returned")
 	}
 
 	var hasFile, hasDir bool
-	for _, e := range out.Entries {
-		switch e.Type {
+	for _, line := range lines {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) < 2 {
+			t.Fatalf("bad line format: %q", line)
+		}
+		switch parts[1] {
 		case "file":
 			hasFile = true
 		case "dir":
@@ -410,14 +419,14 @@ func TestSavings_ListDirectoryDetail(t *testing.T) {
 
 	bashOut := bashOutput(t, fmt.Sprintf("ls -la %s", root))
 
-	_, out, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{Path: root, Detail: true})
+	result, _, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{Path: root, Fields: []string{"name", "type", "size"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	mcpOut := mcpJSON(out)
+	mcpOut := mcpResultText(result)
 
 	// Threshold: MCP must be <= 70% of Bash (>= 30% savings)
-	assertSavings(t, "list_directory(detail=true) vs ls -la", len(bashOut), len(mcpOut), 0.70)
+	assertSavings(t, "list_directory(fields=name,type,size) vs ls -la", len(bashOut), len(mcpOut), 0.70)
 }
 
 func TestSavings_ListDirectorySimple(t *testing.T) {
