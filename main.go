@@ -16,6 +16,10 @@ import (
 const version = "0.1.0"
 
 // --- Input/output types ---
+//
+// Struct tags serve double duty: `json` controls wire format, `jsonschema`
+// generates the MCP tool input schema via jsonschema.For[T](). The SDK
+// validates incoming requests against that schema before calling the handler.
 
 type ListDirectoryInput struct {
 	Path   string `json:"path" jsonschema:"absolute path to list"`
@@ -66,7 +70,20 @@ type FileExistsOutput struct {
 }
 
 // --- Handlers ---
+//
+// Each handler follows the ToolHandlerFor[In, Out] signature from the SDK.
+// Return paths:
+//   - (nil, out, nil): SDK marshals `out` as structured JSON content.
+//   - (result, _, nil): raw CallToolResult is sent as-is (used for plain text).
+//   - (_, _, err):      SDK returns an error to the caller.
 
+// handleListDirectory returns directory contents in one of two modes:
+//   - detail=false (default): plain text, one name per line. Identical output
+//     to `ls`, so there is zero token overhead vs Bash. This avoids the trap
+//     of wrapping simple names in JSON and making things worse.
+//   - detail=true: structured JSON with name, type, and size per entry.
+//     Smaller than `ls -la` because it drops owner, group, date formatting,
+//     and alignment padding.
 func handleListDirectory(_ context.Context, _ *mcp.CallToolRequest, in ListDirectoryInput) (*mcp.CallToolResult, ListDirectoryOutput, error) {
 	entries, err := os.ReadDir(in.Path)
 	if err != nil {
@@ -99,6 +116,10 @@ func handleListDirectory(_ context.Context, _ *mcp.CallToolRequest, in ListDirec
 	return nil, out, nil
 }
 
+// handleFindFiles walks a directory tree and returns relative paths. The main
+// token saving comes from stripping the repeated absolute prefix that `find`
+// prints on every line (e.g. /Users/name/projects/foo/ x N matches).
+// Depth semantics match `find -maxdepth`: depth 1 = immediate children only.
 func handleFindFiles(_ context.Context, _ *mcp.CallToolRequest, in FindFilesInput) (*mcp.CallToolResult, FindFilesOutput, error) {
 	root := filepath.Clean(in.Path)
 	var matches []string
@@ -150,6 +171,8 @@ func handleFindFiles(_ context.Context, _ *mcp.CallToolRequest, in FindFilesInpu
 	return nil, FindFilesOutput{Matches: matches}, nil
 }
 
+// handleFileInfo combines stat + wc -l + file-type detection into a single
+// call. Uses Lstat so symlinks are reported as symlinks, not resolved.
 func handleFileInfo(_ context.Context, _ *mcp.CallToolRequest, in FileInfoInput) (*mcp.CallToolResult, FileInfoOutput, error) {
 	info, err := os.Lstat(in.Path)
 	if err != nil {
@@ -174,6 +197,10 @@ func handleFileInfo(_ context.Context, _ *mcp.CallToolRequest, in FileInfoInput)
 	return nil, out, nil
 }
 
+// handleFileExists replaces patterns like `test -f`, `ls path 2>/dev/null`,
+// and `ls -la path 2>&1`. In real sessions these patterns average 341 chars
+// of output (error text, directory listings used as existence probes, etc.);
+// the structured response is 16-29 chars.
 func handleFileExists(_ context.Context, _ *mcp.CallToolRequest, in FileExistsInput) (*mcp.CallToolResult, FileExistsOutput, error) {
 	info, err := os.Lstat(in.Path)
 	if err != nil {
@@ -189,6 +216,8 @@ func handleFileExists(_ context.Context, _ *mcp.CallToolRequest, in FileExistsIn
 
 // --- Helpers ---
 
+// entryType classifies a DirEntry's file mode. Used by ReadDir results where
+// the mode comes from DirEntry.Type() which only has the type bits set.
 func entryType(mode fs.FileMode) string {
 	switch {
 	case mode&fs.ModeSymlink != 0:
@@ -200,6 +229,8 @@ func entryType(mode fs.FileMode) string {
 	}
 }
 
+// fileType classifies a full os.FileMode from Lstat. Separate from entryType
+// because FileMode.IsDir() checks different bits than ModeDir alone.
 func fileType(mode fs.FileMode) string {
 	switch {
 	case mode&fs.ModeSymlink != 0:
@@ -276,6 +307,8 @@ func main() {
 	}
 }
 
+// mustSchema generates a JSON Schema from Go struct tags for MCP tool
+// input validation. Uses google/jsonschema-go which the MCP SDK depends on.
 func mustSchema[T any]() *jsonschema.Schema {
 	s, err := jsonschema.For[T](nil)
 	if err != nil {

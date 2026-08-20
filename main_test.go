@@ -14,12 +14,16 @@ import (
 )
 
 // fixtureRoot is a fixed path used for savings tests so that absolute path
-// lengths in Bash output are deterministic across runs. Correctness tests
-// use t.TempDir() instead (isolated, auto-cleaned).
+// lengths in Bash output are deterministic across runs. The path mimics a
+// real project location (~50 chars) because find/ls output size scales with
+// path length; a short /tmp/test root would understate the savings. Correctness
+// tests use t.TempDir() instead (isolated, auto-cleaned).
 const fixtureRoot = "/tmp/home/user/projects/example-service"
 
-// fixtureFiles defines the fixture tree. Ordered slice so iteration is
-// deterministic (map iteration order varies across Go versions).
+// fixtureFiles defines the fixture tree. Modeled after a real small Go service
+// with cmd/, internal/, pkg/, docs/, and CI config to produce realistic
+// directory depth, file count, and name lengths. Ordered slice so iteration
+// is deterministic (map iteration order varies across Go versions).
 var fixtureFiles = []struct {
 	path string
 	size int
@@ -97,6 +101,9 @@ func setupStableFixture(t *testing.T) string {
 	return fixtureRoot
 }
 
+// bashOutput runs a command via bash and returns combined stdout+stderr.
+// Used by savings tests to capture the real Bash output that an agent would
+// receive, including error text on missing files.
 func bashOutput(t *testing.T, command string) string {
 	t.Helper()
 	out, err := exec.Command("bash", "-c", command).CombinedOutput()
@@ -107,6 +114,9 @@ func bashOutput(t *testing.T, command string) string {
 	return string(out)
 }
 
+// mcpResultText extracts plain text from a CallToolResult. Used for
+// list_directory in names-only mode, which returns TextContent instead of
+// structured JSON to avoid wrapping simple names in JSON overhead.
 func mcpResultText(result *mcp.CallToolResult) string {
 	if result == nil {
 		return ""
@@ -120,6 +130,9 @@ func mcpResultText(result *mcp.CallToolResult) string {
 	return strings.Join(parts, "")
 }
 
+// mcpJSON marshals the handler's structured output to JSON, matching what
+// the SDK sends over the wire. This is what the agent actually receives,
+// so its length is the fair comparison point against Bash output.
 func mcpJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
@@ -376,6 +389,21 @@ func TestFileExists_Directory(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Savings regression tests
 // ---------------------------------------------------------------------------
+//
+// Each test runs a real Bash command and the equivalent MCP handler against
+// the same stable fixture, then asserts that the MCP output size stays below
+// a threshold ratio of the Bash output size. If a code change bloats the MCP
+// output past the threshold, the test fails.
+//
+// Thresholds are conservative floors derived from 74 real Claude Code sessions
+// (183 filesystem Bash calls). The actual savings are typically better than
+// the threshold. Run `make test-container` for reproducible numbers pinned to
+// GNU coreutils (macOS ls/stat format differs from GNU).
+//
+// Bash commands used here mirror real agent patterns observed in transcripts,
+// not textbook usage. For example, agents check file existence with
+// `ls path 2>/dev/null` (which dumps the full path or listing on success),
+// not the compact `test -f && echo yes`.
 
 func TestSavings_ListDirectoryDetail(t *testing.T) {
 	root := setupStableFixture(t)
