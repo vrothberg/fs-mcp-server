@@ -3,7 +3,7 @@ IMAGE := fs-mcp-server-test
 .PHONY: build test test-container clean
 
 build:
-	go build -o fs-mcp-server .
+	go build -o bin/fs-mcp-server .
 
 test:
 	go test -v -count=1 ./...
@@ -13,4 +13,4 @@ test-container:
 	podman run --rm $(IMAGE)
 
 clean:
-	rm -f fs-mcp-server
+	rm -rf bin/
