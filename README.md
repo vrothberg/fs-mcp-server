@@ -6,19 +6,19 @@ An MCP server for filesystem operations that AI coding agents should not need to
 
 Coding agents like Claude Code, Cursor, and OpenCode use Bash tool calls for basic filesystem operations: `ls`, `find`, `stat`, `test -f`. Each call spawns a shell process, produces human-formatted text output, and the model has to parse that text to extract the 2-3 fields it actually needs.
 
-This server replaces those Bash calls with MCP tools that return compact plain text instead of verbose shell output.
+This server replaces those Bash calls with MCP tools. MCP is not automatically cheaper than a shell; the payload has to be designed that way.
 
 ### Where tokens go to waste
 
-Three layers of waste stack up in the typical agent-to-filesystem path:
+1. **Agents bloat context through habit, not through need.** Models reach for `ls -la`, `find`, `stat`, and `ls path 2>/dev/null` even when they want two fields. Analysis of 251 `ls -la` calls across real sessions shows most of them only needed names. The extra columns, absolute prefixes, and error text are default Unix output plus trained muscle memory. Fifty names-only listings vs `ls -la` is ~43,000 chars of context that carries no signal.
 
-1. **Model drift.** Claude and Sonnet models default to `ls -la` out of habit, fetching permissions, owner, group, and timestamps when they just need file names. Analysis of 251 `ls -la` calls across real sessions shows that most of them only needed names. The tool description is the lever: it shapes what the model asks for.
+2. **A careless MCP server can make the bill worse.** JSON repeats `"name":`, `"type":`, `"size":` on every row (~200 chars of keys for a 12-entry directory). Tool schemas sit in the prompt on every turn, paid even if the model never calls them. An uncapped `find` that walks `node_modules` dumps more tokens than the Bash it replaced. An all-or-nothing `file_info` always returns permissions and timestamps the caller did not ask for.
 
-2. **JSON overhead.** MCP's default wire format repeats key names (`"name":`, `"type":`, `"size":`) on every entry. For a 12-entry directory that is ~200 chars of repeated keys carrying zero information. Plain text with positional fields eliminates that entirely. The LLM does not need JSON to understand a tab-separated `go.mod	484`.
+3. **MCP helps when the payload is designed, not when the transport is MCP.** Compact defaults (names only; `file_info` as type and size), a `fields` parameter like `ps -o`, plain text for listings, JSON only for tiny objects, relative paths, skip lists, and a hard result cap. Those choices are what save tokens. Optional knobs do not help if the default is verbose: models will not opt into compactness they were not given.
 
-3. **All-or-nothing APIs.** Most MCP tools offer one fixed response shape. A `ps -o` style `fields` parameter lets the caller request exactly the columns it needs, so a simple listing costs ~100 chars and a full audit costs ~650, instead of always paying ~960 for `ls -la` or ~1,300 for per-file JSON.
+4. **Routing is still unproven.** Descriptions that name the Bash they replace are the lever we have. Whether models actually pick these tools over Bash, after paying the schema tax, needs a live eval on held-out transcripts. Until that exists, install cost is a bet.
 
-The compound effect is real: if an agent runs 50 directory listings in a session, the difference between `ls -la` and names-only is ~43,000 chars of wasted context. That is tokens the model has to read, attend to, and pay for, all carrying no useful signal.
+5. **Proxies can compress the context after the fact.** Replacing the tool is not the only lever. A proxy sitting between the agent and the model can shrink tool output, JSON, and history that already landed in the prompt — including the `ls -la` the model still chose to run. That path does not depend on routing. [Headroom](https://github.com/chopratejas/headroom) is one example: a local compression layer (library, proxy, or MCP) that cuts tokens before they reach the LLM, reversibly.
 
 ### Savings by operation
 
@@ -50,13 +50,7 @@ Other tools:
 
 `list_directory` and `find_files` use plain text so listings do not pay JSON key repetition. `file_info` and `file_exists` stay JSON: they return one small object, and `file_info`'s `fields` parameter is what avoids all-or-nothing payloads.
 
-## Will the model call these tools?
-
-The four tool schemas are injected into the prompt on every turn. That cost is paid whether or not the model picks them over Bash.
-
-Each description names the Bash it replaces (`ls`, `find -name`, `stat`, `test -f`, `ls path 2>/dev/null`) so a model that was about to shell out has a direct mapping. `testdata/routing.json` is a corpus of those real-session patterns; `go test` fails if a description drops the synonym. Combined name + description + input schema size is also capped so prompt tax cannot grow unnoticed.
-
-A live tool-choice eval against held-out transcripts (does the model actually select these tools, including schema tax in the token budget) is still open.
+`testdata/routing.json` maps the Bash patterns above to these tools. `go test` fails if a description drops the synonym, and it caps combined name + description + schema size so prompt tax cannot grow unnoticed.
 
 ## Install and configure
 
