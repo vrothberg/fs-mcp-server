@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -208,7 +210,7 @@ func TestListDirectory_DetailIncludesType(t *testing.T) {
 
 	var hasFile, hasDir bool
 	for _, line := range lines {
-		parts := strings.SplitN(line, " ", 2)
+		parts := strings.SplitN(line, "\t", 2)
 		if len(parts) < 2 {
 			t.Fatalf("bad line format: %q", line)
 		}
@@ -392,6 +394,307 @@ func TestFileExists_Directory(t *testing.T) {
 	}
 	if out.Type == nil || *out.Type != "dir" {
 		t.Errorf("expected type=dir, got %v", out.Type)
+	}
+}
+
+func TestFindFiles_MaxDepthIncludesDirs(t *testing.T) {
+	root := setupFixtureTree(t)
+	depth := 1
+
+	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Type: "dir", MaxDepth: &depth})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]bool{
+		"cmd": true, "internal": true, "pkg": true,
+		"docs": true, ".github": true, "empty": true,
+	}
+	if len(out.Matches) != len(want) {
+		t.Fatalf("got %d dirs, want %d: %v", len(out.Matches), len(want), out.Matches)
+	}
+	for _, m := range out.Matches {
+		if !want[m] {
+			t.Errorf("unexpected dir at depth 1: %s", m)
+		}
+	}
+}
+
+func TestFindFiles_PathGlob(t *testing.T) {
+	root := setupFixtureTree(t)
+
+	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "cmd/*.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Matches) != 0 {
+		t.Errorf("cmd/*.go should not match nested files, got %v", out.Matches)
+	}
+
+	_, out, err = handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "cmd/server/*.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"cmd/server/main.go": true, "cmd/server/main_test.go": true}
+	if len(out.Matches) != len(want) {
+		t.Fatalf("got %v, want %v", out.Matches, want)
+	}
+	for _, m := range out.Matches {
+		if !want[m] {
+			t.Errorf("unexpected match: %s", m)
+		}
+	}
+}
+
+func TestFindFiles_InvalidPattern(t *testing.T) {
+	root := setupFixtureTree(t)
+	_, _, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "["})
+	if err == nil {
+		t.Fatal("expected error for invalid glob")
+	}
+}
+
+func TestFindFiles_MaxResultsTruncated(t *testing.T) {
+	root := setupFixtureTree(t)
+	limit := 2
+
+	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.go", MaxResults: &limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Matches) != 2 {
+		t.Errorf("got %d matches, want 2: %v", len(out.Matches), out.Matches)
+	}
+	if !out.Truncated {
+		t.Error("expected truncated=true")
+	}
+}
+
+func TestFindFiles_SkipsNodeModules(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []string{"src/index.js", "node_modules/pkg/index.js"} {
+		dir := filepath.Join(root, filepath.Dir(p))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, p), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Matches) != 1 || out.Matches[0] != "src/index.js" {
+		t.Errorf("expected [src/index.js], got %v", out.Matches)
+	}
+
+	_, nested, err := handleFindFiles(context.Background(), nil, FindFilesInput{
+		Path:    filepath.Join(root, "node_modules"),
+		Pattern: "*.js",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nested.Matches) != 1 || nested.Matches[0] != "pkg/index.js" {
+		t.Errorf("searching inside node_modules should return matches, got %v", nested.Matches)
+	}
+}
+
+func TestFindFiles_MissingRoot(t *testing.T) {
+	_, _, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: filepath.Join(t.TempDir(), "nope")})
+	if err == nil {
+		t.Fatal("expected error for missing root")
+	}
+}
+
+func TestFindFiles_WalkErrorRecorded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based walk errors are unix-specific")
+	}
+	root := t.TempDir()
+	denied := filepath.Join(root, "secret")
+	if err := os.Mkdir(denied, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(denied, 0o755) })
+
+	f, err := os.Open(denied)
+	if err == nil {
+		f.Close()
+		t.Skip("process can read mode-000 directories")
+	}
+
+	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Errors) == 0 {
+		t.Fatalf("expected walk error recorded, matches=%v errors=%v", out.Matches, out.Errors)
+	}
+}
+
+func TestListDirectory_TabSeparatedSpaceName(t *testing.T) {
+	root := t.TempDir()
+	name := "go mod.bak"
+	if err := os.WriteFile(filepath.Join(root, name), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{
+		Path:   root,
+		Fields: []string{"name", "size"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSpace(mcpResultText(result))
+	parts := strings.Split(line, "\t")
+	if len(parts) != 2 || parts[0] != name || parts[1] != "6" {
+		t.Fatalf("got %q, want name=%q size=6", line, name)
+	}
+}
+
+func TestListDirectory_UnknownField(t *testing.T) {
+	root := t.TempDir()
+	_, _, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{
+		Path:   root,
+		Fields: []string{"name", "permissions"},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown field")
+	}
+}
+
+func TestListDirectory_SizeAndPerm(t *testing.T) {
+	root := setupFixtureTree(t)
+	result, _, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{
+		Path:   root,
+		Fields: []string{"name", "size", "perm"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(mcpResultText(result)), "\n") {
+		parts := strings.Split(line, "\t")
+		if parts[0] != "go.mod" {
+			continue
+		}
+		found = true
+		if len(parts) != 3 {
+			t.Fatalf("go.mod line %q: want 3 columns", line)
+		}
+		if parts[1] != "50" {
+			t.Errorf("size: got %q, want 50", parts[1])
+		}
+		info, err := os.Stat(filepath.Join(root, "go.mod"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parts[2] != info.Mode().Perm().String() {
+			t.Errorf("perm: got %q, want %q", parts[2], info.Mode().Perm().String())
+		}
+	}
+	if !found {
+		t.Fatal("go.mod not listed")
+	}
+}
+
+func TestListDirectory_Missing(t *testing.T) {
+	_, _, err := handleListDirectory(context.Background(), nil, ListDirectoryInput{Path: filepath.Join(t.TempDir(), "nope")})
+	if err == nil {
+		t.Fatal("expected error for missing directory")
+	}
+}
+
+func TestCountLines(t *testing.T) {
+	root := t.TempDir()
+
+	empty := filepath.Join(root, "empty")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n, err := countLines(empty)
+	if err != nil || n != 0 {
+		t.Errorf("empty: got %d, %v; want 0, nil", n, err)
+	}
+
+	nonewline := filepath.Join(root, "nonewline")
+	if err := os.WriteFile(nonewline, []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n, err = countLines(nonewline)
+	if err != nil || n != 1 {
+		t.Errorf("no newline: got %d, %v; want 1, nil", n, err)
+	}
+
+	binary := filepath.Join(root, "bin")
+	if err := os.WriteFile(binary, []byte("a\x00b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := countLines(binary); !errors.Is(err, errBinaryFile) {
+		t.Errorf("binary: got %v, want errBinaryFile", err)
+	}
+
+	big := filepath.Join(root, "big")
+	data := make([]byte, maxLineCountBytes+1)
+	for i := range data {
+		data[i] = 'x'
+	}
+	if err := os.WriteFile(big, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := countLines(big); !errors.Is(err, errFileTooLarge) {
+		t.Errorf("too large: got %v, want errFileTooLarge", err)
+	}
+}
+
+func TestFileInfo_BinaryOmitsLines(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "blob")
+	if err := os.WriteFile(p, []byte("a\x00b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{Path: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Lines != nil {
+		t.Errorf("lines should be omitted for binary, got %v", out.Lines)
+	}
+}
+
+func TestFileInfo_Symlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "the-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{Path: link})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Type != "symlink" {
+		t.Errorf("type: got %q, want symlink", out.Type)
+	}
+	if out.Lines != nil {
+		t.Errorf("lines should be nil for symlink, got %v", out.Lines)
+	}
+
+	_, exists, err := handleFileExists(context.Background(), nil, FileExistsInput{Path: link})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists.Type == nil || *exists.Type != "symlink" {
+		t.Errorf("file_exists type: got %v, want symlink", exists.Type)
 	}
 }
 
