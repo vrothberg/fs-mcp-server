@@ -27,7 +27,7 @@ var (
 	errBinaryFile   = errors.New("binary file")
 	errFileTooLarge = errors.New("file exceeds line-count size limit")
 
-	listFieldNames = map[string]bool{
+	columnFields = map[string]bool{
 		"name":     true,
 		"type":     true,
 		"size":     true,
@@ -35,6 +35,8 @@ var (
 		"modified": true,
 		"lines":    true,
 	}
+
+	defaultFileInfoFields = []string{"type", "size"}
 )
 
 // --- Input/output types ---
@@ -56,22 +58,17 @@ type FindFilesInput struct {
 	MaxResults *int   `json:"max_results,omitempty" jsonschema:"maximum matches to return. Default 1000, hard max 10000"`
 }
 
-type FindFilesOutput struct {
-	Matches   []string `json:"matches"`
-	Truncated bool     `json:"truncated,omitempty"`
-	Errors    []string `json:"errors,omitempty"`
-}
-
 type FileInfoInput struct {
-	Path string `json:"path" jsonschema:"absolute path to the file or directory"`
+	Path   string   `json:"path" jsonschema:"absolute path to the file or directory"`
+	Fields []string `json:"fields,omitempty" jsonschema:"columns to include, like ps -o. Available: name, type, size, perm, modified, lines. Default: type, size."`
 }
 
 type FileInfoOutput struct {
-	Name        string `json:"name"`
-	Type        string `json:"type"` // "file", "dir", "symlink"
-	Size        int64  `json:"size"`
-	Permissions string `json:"permissions"`
-	Modified    string `json:"modified"`
+	Name        string `json:"name,omitempty"`
+	Type        string `json:"type,omitempty"` // "file", "dir", "symlink"
+	Size        *int64 `json:"size,omitempty"`
+	Permissions string `json:"permissions,omitempty"`
+	Modified    string `json:"modified,omitempty"`
 	Lines       *int   `json:"lines,omitempty"`
 }
 
@@ -98,7 +95,7 @@ type FileExistsOutput struct {
 // tab-separated so names with spaces stay unambiguous:
 // fields=["name","size","perm"] -> "go.mod\t484\t-rw-r--r--".
 func handleListDirectory(_ context.Context, _ *mcp.CallToolRequest, in ListDirectoryInput) (*mcp.CallToolResult, any, error) {
-	if err := validateListFields(in.Fields); err != nil {
+	if err := validateFields(in.Fields); err != nil {
 		return nil, nil, err
 	}
 
@@ -168,21 +165,22 @@ func handleListDirectory(_ context.Context, _ *mcp.CallToolRequest, in ListDirec
 	}, nil, nil
 }
 
-// handleFindFiles walks a directory tree and returns relative paths. The main
-// token saving comes from stripping the repeated absolute prefix that `find`
-// prints on every line (e.g. /Users/name/projects/foo/ x N matches).
+// handleFindFiles walks a directory tree and returns relative paths as plain
+// text (one path per line). The main token saving comes from stripping the
+// repeated absolute prefix that `find` prints on every line, and from avoiding
+// a JSON array wrapper.
 // Depth semantics match `find -maxdepth`: depth 1 = immediate children only,
 // and those children are included (directories at the boundary are listed,
 // then not descended into).
-func handleFindFiles(_ context.Context, _ *mcp.CallToolRequest, in FindFilesInput) (*mcp.CallToolResult, FindFilesOutput, error) {
+func handleFindFiles(_ context.Context, _ *mcp.CallToolRequest, in FindFilesInput) (*mcp.CallToolResult, any, error) {
 	switch in.Type {
 	case "", "file", "dir", "symlink":
 	default:
-		return nil, FindFilesOutput{}, fmt.Errorf("invalid type %q; want file, dir, or symlink", in.Type)
+		return nil, nil, fmt.Errorf("invalid type %q; want file, dir, or symlink", in.Type)
 	}
 	if in.Pattern != "" {
 		if _, err := path.Match(filepath.ToSlash(in.Pattern), ""); err != nil {
-			return nil, FindFilesOutput{}, fmt.Errorf("invalid pattern: %w", err)
+			return nil, nil, fmt.Errorf("invalid pattern: %w", err)
 		}
 	}
 
@@ -257,33 +255,51 @@ func handleFindFiles(_ context.Context, _ *mcp.CallToolRequest, in FindFilesInpu
 		return nil
 	})
 	if err != nil {
-		return nil, FindFilesOutput{}, fmt.Errorf("walking directory: %w", err)
+		return nil, nil, fmt.Errorf("walking directory: %w", err)
 	}
-	if matches == nil {
-		matches = []string{}
-	}
-	return nil, FindFilesOutput{Matches: matches, Truncated: truncated, Errors: walkErrs}, nil
+	return findFilesResult(matches, truncated, walkErrs), nil, nil
 }
 
 // handleFileInfo combines stat + wc -l + file-type detection into a single
 // call. Uses Lstat so symlinks are reported as symlinks, not resolved.
 func handleFileInfo(_ context.Context, _ *mcp.CallToolRequest, in FileInfoInput) (*mcp.CallToolResult, FileInfoOutput, error) {
+	fields := in.Fields
+	if len(fields) == 0 {
+		fields = defaultFileInfoFields
+	}
+	if err := validateFields(fields); err != nil {
+		return nil, FileInfoOutput{}, err
+	}
+
 	info, err := os.Lstat(in.Path)
 	if err != nil {
 		return nil, FileInfoOutput{}, fmt.Errorf("stat: %w", err)
 	}
 
-	out := FileInfoOutput{
-		Name:        info.Name(),
-		Type:        fileType(info.Mode()),
-		Size:        info.Size(),
-		Permissions: info.Mode().Perm().String(),
-		Modified:    info.ModTime().Format(time.RFC3339),
+	want := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		want[f] = true
 	}
 
-	if info.Mode().IsRegular() {
-		lines, err := countLines(in.Path)
-		if err == nil {
+	var out FileInfoOutput
+	if want["name"] {
+		out.Name = info.Name()
+	}
+	if want["type"] {
+		out.Type = fileType(info.Mode())
+	}
+	if want["size"] {
+		s := info.Size()
+		out.Size = &s
+	}
+	if want["perm"] {
+		out.Permissions = info.Mode().Perm().String()
+	}
+	if want["modified"] {
+		out.Modified = info.ModTime().Format(time.RFC3339)
+	}
+	if want["lines"] && info.Mode().IsRegular() {
+		if lines, err := countLines(in.Path); err == nil {
 			out.Lines = &lines
 		}
 	}
@@ -310,13 +326,29 @@ func handleFileExists(_ context.Context, _ *mcp.CallToolRequest, in FileExistsIn
 
 // --- Helpers ---
 
-func validateListFields(fields []string) error {
+func validateFields(fields []string) error {
 	for _, f := range fields {
-		if !listFieldNames[f] {
+		if !columnFields[f] {
 			return fmt.Errorf("unknown field %q; available: name, type, size, perm, modified, lines", f)
 		}
 	}
 	return nil
+}
+
+func findFilesResult(matches []string, truncated bool, walkErrs []string) *mcp.CallToolResult {
+	var b strings.Builder
+	for _, m := range matches {
+		b.WriteString(m)
+		b.WriteByte('\n')
+	}
+	content := []mcp.Content{&mcp.TextContent{Text: b.String()}}
+	if truncated {
+		content = append(content, &mcp.TextContent{Text: "truncated"})
+	}
+	if len(walkErrs) > 0 {
+		content = append(content, &mcp.TextContent{Text: "errors:\n" + strings.Join(walkErrs, "\n")})
+	}
+	return &mcp.CallToolResult{Content: content}
 }
 
 func findMaxResults(in FindFilesInput) int {
@@ -421,9 +453,7 @@ func countLines(filename string) (int, error) {
 
 // --- Main ---
 
-func main() {
-	ctx := context.Background()
-
+func newServer() *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "fs-mcp-server", Version: version},
 		nil,
@@ -431,29 +461,35 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_directory",
-		Description: "List the contents of a directory. By default returns one name per line. Use the fields parameter (like ps -o) to add only the columns you need: type, size, perm, modified, lines. Extra columns are tab-separated. Example: fields=[\"name\",\"size\"] returns \"go.mod\\t484\" per line. Only request fields you will actually use.",
+		Description: "List a directory. Replaces ls and ls -la. By default returns one name per line. Use fields (like ps -o) to add type, size, perm, modified, lines. Extra columns are tab-separated so names with spaces stay unambiguous. Example: fields=[\"name\",\"size\"] returns \"go.mod\\t484\". Only request fields you will actually use.",
 		InputSchema: mustSchema[ListDirectoryInput](),
 	}, handleListDirectory)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "find_files",
-		Description: "Recursively find files and directories matching a glob. *.go matches any basename; cmd/*.go matches relative paths. Returns relative paths from the search root. Skips .git and node_modules. Caps at 1000 matches (max_results, hard max 10000); truncated is true if the cap was hit.",
+		Description: "Recursively find files and directories matching a glob, replacing find -name. *.go matches any basename; cmd/*.go matches relative paths. Returns one relative path per line (no JSON, no repeated absolute prefixes). Skips .git and node_modules. Caps at 1000 matches (max_results, hard max 10000); a follow-up content block says truncated if the cap was hit.",
 		InputSchema: mustSchema[FindFilesInput](),
 	}, handleFindFiles)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "file_info",
-		Description: "Get metadata about a file or directory: name, type, size, permissions, modification time, and line count (for regular files). Replaces stat/wc -l/file in a single call. Line count is omitted for binary files and files larger than 1MiB.",
+		Description: "Get metadata about a file or directory. Replaces stat, wc -l, and file. By default returns type and size. Use fields (like ps -o) to add name, perm, modified, lines. Line count is omitted for binary files and files larger than 1MiB.",
 		InputSchema: mustSchema[FileInfoInput](),
 	}, handleFileInfo)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "file_exists",
-		Description: "Check whether a path exists and what type it is (file, dir, symlink). Returns a boolean and type. Replaces `test -f`, `ls path 2>/dev/null`, and similar existence checks with no error-text parsing.",
+		Description: "Check whether a path exists and what type it is (file, dir, symlink). Returns a boolean and type. Replaces test -f, ls path 2>/dev/null, and similar existence checks with no error-text parsing.",
 		InputSchema: mustSchema[FileExistsInput](),
 	}, handleFileExists)
 
-	session, err := server.Connect(ctx, &mcp.StdioTransport{}, nil)
+	return server
+}
+
+func main() {
+	ctx := context.Background()
+
+	session, err := newServer().Connect(ctx, &mcp.StdioTransport{}, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to connect: %v\n", err)
 		os.Exit(1)

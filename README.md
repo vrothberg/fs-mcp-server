@@ -14,7 +14,7 @@ Three layers of waste stack up in the typical agent-to-filesystem path:
 
 1. **Model drift.** Claude and Sonnet models default to `ls -la` out of habit, fetching permissions, owner, group, and timestamps when they just need file names. Analysis of 251 `ls -la` calls across real sessions shows that most of them only needed names. The tool description is the lever: it shapes what the model asks for.
 
-2. **JSON overhead.** MCP's default wire format repeats key names (`"name":`, `"type":`, `"size":`) on every entry. For a 12-entry directory that is ~200 chars of repeated keys carrying zero information. Plain text with positional fields eliminates that entirely. The LLM does not need JSON to understand `go.mod file 484`.
+2. **JSON overhead.** MCP's default wire format repeats key names (`"name":`, `"type":`, `"size":`) on every entry. For a 12-entry directory that is ~200 chars of repeated keys carrying zero information. Plain text with positional fields eliminates that entirely. The LLM does not need JSON to understand a tab-separated `go.mod	484`.
 
 3. **All-or-nothing APIs.** Most MCP tools offer one fixed response shape. A `ps -o` style `fields` parameter lets the caller request exactly the columns it needs, so a simple listing costs ~100 chars and a full audit costs ~650, instead of always paying ~960 for `ls -la` or ~1,300 for per-file JSON.
 
@@ -43,10 +43,20 @@ Other tools:
 
 | Tool | Replaces | What it returns |
 |---|---|---|
-| `list_directory` | `ls`, `ls -la` | One name per line; use `fields` (like `ps -o`) to add columns: type, size, perm, modified, lines |
-| `find_files` | `find` | `{matches: ["relative/path", ...]}` |
-| `file_info` | `stat`, `wc -l`, `file` | `{name, type, size, permissions, modified, lines}` |
-| `file_exists` | `test -f`, `ls 2>/dev/null` | `{exists: bool, type: "file"\|"dir"\|"symlink"}` |
+| `list_directory` | `ls`, `ls -la` | One name per line. `fields` (like `ps -o`) adds tab-separated columns: type, size, perm, modified, lines. Default: name only. |
+| `find_files` | `find -name` | One relative path per line. Basename globs (`*.go`) or path globs (`cmd/*.go`). Skips `.git` and `node_modules`. Caps at 1000 matches (`max_results`); extra content `truncated` if the cap was hit. Walk errors are reported in a follow-up `errors:` block. |
+| `file_info` | `stat`, `wc -l`, `file` | JSON with only requested `fields`. Default: `type`, `size`. Optional: name, perm, modified, lines (omitted for binaries and files > 1MiB). |
+| `file_exists` | `test -f`, `ls path 2>/dev/null` | `{exists: bool, type: "file"\|"dir"\|"symlink"}` |
+
+`list_directory` and `find_files` use plain text so listings do not pay JSON key repetition. `file_info` and `file_exists` stay JSON: they return one small object, and `file_info`'s `fields` parameter is what avoids all-or-nothing payloads.
+
+## Will the model call these tools?
+
+The four tool schemas are injected into the prompt on every turn. That cost is paid whether or not the model picks them over Bash.
+
+Each description names the Bash it replaces (`ls`, `find -name`, `stat`, `test -f`, `ls path 2>/dev/null`) so a model that was about to shell out has a direct mapping. `testdata/routing.json` is a corpus of those real-session patterns; `go test` fails if a description drops the synonym. Combined name + description + input schema size is also capped so prompt tax cannot grow unnoticed.
+
+A live tool-choice eval against held-out transcripts (does the model actually select these tools, including schema tax in the token budget) is still open.
 
 ## Install and configure
 

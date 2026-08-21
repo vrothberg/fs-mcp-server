@@ -1,0 +1,37 @@
+[
+  {
+    "id": "ls-la",
+    "bash": "ls -la",
+    "intent": "list a directory; usually only names are needed",
+    "tool": "list_directory",
+    "must_mention": ["ls", "fields"]
+  },
+  {
+    "id": "find-name",
+    "bash": "find -name '*.go'",
+    "intent": "recursively find files by glob",
+    "tool": "find_files",
+    "must_mention": ["find", "glob"]
+  },
+  {
+    "id": "stat-wc",
+    "bash": "stat && wc -l",
+    "intent": "file metadata and optional line count",
+    "tool": "file_info",
+    "must_mention": ["stat", "fields"]
+  },
+  {
+    "id": "test-f",
+    "bash": "test -f",
+    "intent": "check whether a path exists",
+    "tool": "file_exists",
+    "must_mention": ["test -f"]
+  },
+  {
+    "id": "ls-exists",
+    "bash": "ls path 2>/dev/null",
+    "intent": "existence probe via ls",
+    "tool": "file_exists",
+    "must_mention": ["ls"]
+  }
+]

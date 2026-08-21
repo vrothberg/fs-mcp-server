@@ -15,12 +15,11 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// fixtureRoot is a fixed path used for savings tests so that absolute path
-// lengths in Bash output are deterministic across runs. The path mimics a
-// real project location (~50 chars) because find/ls output size scales with
-// path length; a short /tmp/test root would understate the savings. Correctness
-// tests use t.TempDir() instead (isolated, auto-cleaned).
-const fixtureRoot = "/tmp/home/user/projects/example-service"
+// fixtureRootSuffix is appended to t.TempDir() for savings tests so absolute
+// path lengths in Bash output stay realistic. find/ls output size scales with
+// path length; a short temp root would understate the savings. Isolated and
+// auto-cleaned via t.TempDir(), unlike a hardcoded /tmp path.
+const fixtureRootSuffix = "home/user/projects/example-service"
 
 // fixtureFiles defines the fixture tree. Modeled after a real small Go service
 // with cmd/, internal/, pkg/, docs/, and CI config to produce realistic
@@ -97,10 +96,9 @@ func setupFixtureTree(t *testing.T) string {
 
 func setupStableFixture(t *testing.T) string {
 	t.Helper()
-	os.RemoveAll(fixtureRoot)
-	populateFixture(t, fixtureRoot)
-	t.Cleanup(func() { os.RemoveAll(fixtureRoot) })
-	return fixtureRoot
+	root := filepath.Join(t.TempDir(), fixtureRootSuffix)
+	populateFixture(t, root)
+	return root
 }
 
 // bashOutput runs a command via bash and returns combined stdout+stderr.
@@ -138,6 +136,57 @@ func mcpResultText(result *mcp.CallToolResult) string {
 func mcpJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+func parseFindResult(t *testing.T, result *mcp.CallToolResult) (matches []string, truncated bool, errs []string) {
+	t.Helper()
+	if result == nil || len(result.Content) == 0 {
+		t.Fatal("no find_files result")
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	text = strings.TrimSuffix(text, "\n")
+	if text != "" {
+		matches = strings.Split(text, "\n")
+	} else {
+		matches = []string{}
+	}
+	for _, c := range result.Content[1:] {
+		tc, ok := c.(*mcp.TextContent)
+		if !ok {
+			continue
+		}
+		switch {
+		case tc.Text == "truncated":
+			truncated = true
+		case strings.HasPrefix(tc.Text, "errors:\n"):
+			errs = strings.Split(strings.TrimPrefix(tc.Text, "errors:\n"), "\n")
+		}
+	}
+	return
+}
+
+func mustFind(t *testing.T, in FindFilesInput) (matches []string, truncated bool, errs []string) {
+	t.Helper()
+	result, _, err := handleFindFiles(context.Background(), nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parseFindResult(t, result)
+}
+
+func connectServer(t *testing.T) *mcp.ClientSession {
+	t.Helper()
+	ctx := context.Background()
+	t1, t2 := mcp.NewInMemoryTransports()
+	if _, err := newServer().Connect(ctx, t1, nil); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs
 }
 
 // assertSavings checks that MCP output is at most maxRatio of Bash output.
@@ -232,10 +281,7 @@ func TestListDirectory_DetailIncludesType(t *testing.T) {
 func TestFindFiles_GlobPattern(t *testing.T) {
 	root := setupFixtureTree(t)
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.go"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	out, _, _ := mustFind(t, FindFilesInput{Path: root, Pattern: "*.go"})
 
 	expected := map[string]bool{}
 	for _, f := range fixtureFiles {
@@ -244,10 +290,10 @@ func TestFindFiles_GlobPattern(t *testing.T) {
 		}
 	}
 
-	if len(out.Matches) != len(expected) {
-		t.Fatalf("got %d matches, want %d: %v", len(out.Matches), len(expected), out.Matches)
+	if len(out) != len(expected) {
+		t.Fatalf("got %d matches, want %d: %v", len(out), len(expected), out)
 	}
-	for _, m := range out.Matches {
+	for _, m := range out {
 		if !expected[m] {
 			t.Errorf("unexpected match: %s", m)
 		}
@@ -258,20 +304,13 @@ func TestFindFiles_MaxDepth(t *testing.T) {
 	root := setupFixtureTree(t)
 	depth := 1
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.go", MaxDepth: &depth})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(out.Matches) != 1 || out.Matches[0] != "main.go" {
-		t.Errorf("expected [main.go] at depth 1, got %v", out.Matches)
+	out, _, _ := mustFind(t, FindFilesInput{Path: root, Pattern: "*.go", MaxDepth: &depth})
+	if len(out) != 1 || out[0] != "main.go" {
+		t.Errorf("expected [main.go] at depth 1, got %v", out)
 	}
 
 	depth = 3
-	_, out2, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.go", MaxDepth: &depth})
-	if err != nil {
-		t.Fatal(err)
-	}
+	out2, _, _ := mustFind(t, FindFilesInput{Path: root, Pattern: "*.go", MaxDepth: &depth})
 
 	expected := map[string]bool{}
 	for _, f := range fixtureFiles {
@@ -283,38 +322,60 @@ func TestFindFiles_MaxDepth(t *testing.T) {
 			expected[f.path] = true
 		}
 	}
-	if len(out2.Matches) != len(expected) {
-		t.Errorf("depth 3: got %d matches, want %d: %v", len(out2.Matches), len(expected), out2.Matches)
+	if len(out2) != len(expected) {
+		t.Errorf("depth 3: got %d matches, want %d: %v", len(out2), len(expected), out2)
 	}
 }
 
 func TestFindFiles_TypeFilter(t *testing.T) {
 	root := setupFixtureTree(t)
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Type: "dir"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	out, _, _ := mustFind(t, FindFilesInput{Path: root, Type: "dir"})
 
 	expected := map[string]bool{}
 	for _, d := range fixtureDirs {
 		expected[d] = true
-		// Also add parent dirs that are implicit
 		parts := strings.Split(d, string(filepath.Separator))
 		for i := 1; i < len(parts); i++ {
 			expected[strings.Join(parts[:i], string(filepath.Separator))] = true
 		}
 	}
-	if len(out.Matches) != len(expected) {
-		t.Fatalf("got %d dirs, want %d\ngot:  %v\nwant: %v", len(out.Matches), len(expected), out.Matches, expected)
+	if len(out) != len(expected) {
+		t.Fatalf("got %d dirs, want %d\ngot:  %v\nwant: %v", len(out), len(expected), out, expected)
 	}
 }
 
-func TestFileInfo_RegularFile(t *testing.T) {
+func TestFileInfo_DefaultTypeSize(t *testing.T) {
 	root := setupFixtureTree(t)
 	path := filepath.Join(root, "cmd/server/main.go")
 
 	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if out.Name != "" {
+		t.Errorf("name should be omitted by default, got %q", out.Name)
+	}
+	if out.Type != "file" {
+		t.Errorf("type: got %q, want %q", out.Type, "file")
+	}
+	if out.Size == nil || *out.Size != 900 {
+		t.Errorf("size: got %v, want 900", out.Size)
+	}
+	if out.Permissions != "" || out.Modified != "" || out.Lines != nil {
+		t.Errorf("default should be type+size only, got %+v", out)
+	}
+}
+
+func TestFileInfo_RequestedFields(t *testing.T) {
+	root := setupFixtureTree(t)
+	path := filepath.Join(root, "cmd/server/main.go")
+
+	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{
+		Path:   path,
+		Fields: []string{"name", "type", "size", "lines"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,8 +386,8 @@ func TestFileInfo_RegularFile(t *testing.T) {
 	if out.Type != "file" {
 		t.Errorf("type: got %q, want %q", out.Type, "file")
 	}
-	if out.Size != 900 {
-		t.Errorf("size: got %d, want %d", out.Size, 900)
+	if out.Size == nil || *out.Size != 900 {
+		t.Errorf("size: got %v, want 900", out.Size)
 	}
 	if out.Lines == nil || *out.Lines != 1 {
 		t.Errorf("lines: got %v, want 1", out.Lines)
@@ -401,19 +462,16 @@ func TestFindFiles_MaxDepthIncludesDirs(t *testing.T) {
 	root := setupFixtureTree(t)
 	depth := 1
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Type: "dir", MaxDepth: &depth})
-	if err != nil {
-		t.Fatal(err)
-	}
+	out, _, _ := mustFind(t, FindFilesInput{Path: root, Type: "dir", MaxDepth: &depth})
 
 	want := map[string]bool{
 		"cmd": true, "internal": true, "pkg": true,
 		"docs": true, ".github": true, "empty": true,
 	}
-	if len(out.Matches) != len(want) {
-		t.Fatalf("got %d dirs, want %d: %v", len(out.Matches), len(want), out.Matches)
+	if len(out) != len(want) {
+		t.Fatalf("got %d dirs, want %d: %v", len(out), len(want), out)
 	}
-	for _, m := range out.Matches {
+	for _, m := range out {
 		if !want[m] {
 			t.Errorf("unexpected dir at depth 1: %s", m)
 		}
@@ -423,23 +481,17 @@ func TestFindFiles_MaxDepthIncludesDirs(t *testing.T) {
 func TestFindFiles_PathGlob(t *testing.T) {
 	root := setupFixtureTree(t)
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "cmd/*.go"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out.Matches) != 0 {
-		t.Errorf("cmd/*.go should not match nested files, got %v", out.Matches)
+	out, _, _ := mustFind(t, FindFilesInput{Path: root, Pattern: "cmd/*.go"})
+	if len(out) != 0 {
+		t.Errorf("cmd/*.go should not match nested files, got %v", out)
 	}
 
-	_, out, err = handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "cmd/server/*.go"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	out, _, _ = mustFind(t, FindFilesInput{Path: root, Pattern: "cmd/server/*.go"})
 	want := map[string]bool{"cmd/server/main.go": true, "cmd/server/main_test.go": true}
-	if len(out.Matches) != len(want) {
-		t.Fatalf("got %v, want %v", out.Matches, want)
+	if len(out) != len(want) {
+		t.Fatalf("got %v, want %v", out, want)
 	}
-	for _, m := range out.Matches {
+	for _, m := range out {
 		if !want[m] {
 			t.Errorf("unexpected match: %s", m)
 		}
@@ -458,15 +510,12 @@ func TestFindFiles_MaxResultsTruncated(t *testing.T) {
 	root := setupFixtureTree(t)
 	limit := 2
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.go", MaxResults: &limit})
-	if err != nil {
-		t.Fatal(err)
+	out, truncated, _ := mustFind(t, FindFilesInput{Path: root, Pattern: "*.go", MaxResults: &limit})
+	if len(out) != 2 {
+		t.Errorf("got %d matches, want 2: %v", len(out), out)
 	}
-	if len(out.Matches) != 2 {
-		t.Errorf("got %d matches, want 2: %v", len(out.Matches), out.Matches)
-	}
-	if !out.Truncated {
-		t.Error("expected truncated=true")
+	if !truncated {
+		t.Error("expected truncated")
 	}
 }
 
@@ -482,23 +531,17 @@ func TestFindFiles_SkipsNodeModules(t *testing.T) {
 		}
 	}
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.js"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out.Matches) != 1 || out.Matches[0] != "src/index.js" {
-		t.Errorf("expected [src/index.js], got %v", out.Matches)
+	out, _, _ := mustFind(t, FindFilesInput{Path: root, Pattern: "*.js"})
+	if len(out) != 1 || out[0] != "src/index.js" {
+		t.Errorf("expected [src/index.js], got %v", out)
 	}
 
-	_, nested, err := handleFindFiles(context.Background(), nil, FindFilesInput{
+	nested, _, _ := mustFind(t, FindFilesInput{
 		Path:    filepath.Join(root, "node_modules"),
 		Pattern: "*.js",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(nested.Matches) != 1 || nested.Matches[0] != "pkg/index.js" {
-		t.Errorf("searching inside node_modules should return matches, got %v", nested.Matches)
+	if len(nested) != 1 || nested[0] != "pkg/index.js" {
+		t.Errorf("searching inside node_modules should return matches, got %v", nested)
 	}
 }
 
@@ -526,12 +569,9 @@ func TestFindFiles_WalkErrorRecorded(t *testing.T) {
 		t.Skip("process can read mode-000 directories")
 	}
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out.Errors) == 0 {
-		t.Fatalf("expected walk error recorded, matches=%v errors=%v", out.Matches, out.Errors)
+	matches, _, errs := mustFind(t, FindFilesInput{Path: root})
+	if len(errs) == 0 {
+		t.Fatalf("expected walk error recorded, matches=%v errors=%v", matches, errs)
 	}
 }
 
@@ -658,7 +698,10 @@ func TestFileInfo_BinaryOmitsLines(t *testing.T) {
 	if err := os.WriteFile(p, []byte("a\x00b"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{Path: p})
+	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{
+		Path:   p,
+		Fields: []string{"type", "lines"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,11 +796,11 @@ func TestSavings_FindFiles(t *testing.T) {
 
 	bashOut := bashOutput(t, fmt.Sprintf("find %s -name '*.go'", root))
 
-	_, out, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.go"})
+	result, _, err := handleFindFiles(context.Background(), nil, FindFilesInput{Path: root, Pattern: "*.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	mcpOut := mcpJSON(out)
+	mcpOut := mcpResultText(result)
 
 	// find outputs absolute paths; MCP outputs relative. Threshold: <= 75% (>= 25% savings).
 	// Real-world savings are higher (~54%) because paths are longer, but the fixture tree
@@ -827,7 +870,10 @@ func TestSavings_FileInfo(t *testing.T) {
 	// Bash equivalent: stat + wc -l combined
 	statOut := bashOutput(t, fmt.Sprintf("stat %s && wc -l %s", path, path))
 
-	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{Path: path})
+	_, out, err := handleFileInfo(context.Background(), nil, FileInfoInput{
+		Path:   path,
+		Fields: []string{"name", "type", "size", "perm", "modified", "lines"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -855,4 +901,107 @@ func TestSavings_FindFilesDirectoryListing(t *testing.T) {
 	// MCP: {"exists":true,"type":"dir"} (28 chars)
 	// With short temp-dir paths the fixture listing is small, so use a lenient threshold.
 	assertSavings(t, "file_exists(dir) vs ls dir 2>/dev/null", len(bashOut), len(mcpOut), 0.80)
+}
+
+func TestProtocol_ListToolsAndCall(t *testing.T) {
+	cs := connectServer(t)
+	ctx := context.Background()
+
+	listed, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, tool := range listed.Tools {
+		names[tool.Name] = true
+	}
+	for _, want := range []string{"list_directory", "find_files", "file_info", "file_exists"} {
+		if !names[want] {
+			t.Errorf("missing tool %s", want)
+		}
+	}
+
+	root := setupFixtureTree(t)
+
+	listRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "list_directory",
+		Arguments: map[string]any{"path": root},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listRes.IsError {
+		t.Fatalf("list_directory error: %s", mcpResultText(listRes))
+	}
+	if !strings.Contains(mcpResultText(listRes), "main.go") {
+		t.Errorf("list_directory missing main.go: %q", mcpResultText(listRes))
+	}
+
+	findRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "find_files",
+		Arguments: map[string]any{"path": root, "pattern": "*.go"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findRes.IsError {
+		t.Fatalf("find_files error: %s", mcpResultText(findRes))
+	}
+	matches, _, _ := parseFindResult(t, findRes)
+	if len(matches) == 0 {
+		t.Fatal("find_files returned no matches")
+	}
+
+	infoRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "file_info",
+		Arguments: map[string]any{"path": filepath.Join(root, "main.go")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if infoRes.IsError {
+		t.Fatalf("file_info error: %s", mcpResultText(infoRes))
+	}
+	infoJSON := mcpResultText(infoRes)
+	if strings.Contains(infoJSON, `"name"`) {
+		t.Errorf("default file_info should omit name, got %s", infoJSON)
+	}
+	if !strings.Contains(infoJSON, `"type"`) || !strings.Contains(infoJSON, `"size"`) {
+		t.Errorf("default file_info should include type and size, got %s", infoJSON)
+	}
+
+	existsRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "file_exists",
+		Arguments: map[string]any{"path": filepath.Join(root, "nope")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existsRes.IsError {
+		t.Fatalf("file_exists error: %s", mcpResultText(existsRes))
+	}
+	if !strings.Contains(mcpResultText(existsRes), `"exists":false`) {
+		t.Errorf("file_exists miss: got %s", mcpResultText(existsRes))
+	}
+
+	bad, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "list_directory",
+		Arguments: map[string]any{"path": root, "fields": []string{"permissions"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bad.IsError {
+		t.Fatal("expected protocol error for unknown field")
+	}
+}
+
+func TestFileInfo_UnknownField(t *testing.T) {
+	_, _, err := handleFileInfo(context.Background(), nil, FileInfoInput{
+		Path:   t.TempDir(),
+		Fields: []string{"permissions"},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown field")
+	}
 }
